@@ -7,40 +7,58 @@ import numpy as np
 import pickle
 import pdb
 import argparse
+import onmt
 
-class TextCNN(nn.Module):
+class Seq2seqModel(nn.Module):
   def __init__(self, args):
-    super(TextCNN, self).__init__()
-    self.args = args
-    with open(args.embed_file, "rb") as f:
-      embeddings = torch.from_numpy(np.load(f))
-    self.embed = nn.Embedding(embeddings.size(0), embeddings.size(1))
-    self.embed.weight.data.copy_(embeddings)
-    #self.embed.weight.requires_grad = False
-    #if args.cuda:
-    #  self.embed = self.embed.cuda()
-    self.convs1 = nn.ModuleList([nn.Conv2d(1, args.hidden_size, (k, args.embedding_size))
-            for k in args.kernel_sizes])
-    self.dropout = nn.Dropout(args.dropout)
-    final_size = len(args.kernel_sizes)*args.hidden_size
-    self.fc1 = nn.Bilinear(final_size, final_size, 1)
+    super(Seq2seqModel, self).__init__()
+    encoder = onmt.Models.Encoder(args)
+    decoder = onmt.Models.Decoder(args)
+    generator = nn.Sequential(
+      nn.Linear(args.rnn_size, args.vocab_size),
+      nn.LogSoftmax())
 
-  def forward(self, dialogue, options):
-    x = self.embed(dialogue)
-    x = x.unsqueeze(1)
-    x = [F.relu(conv(x)).squeeze(3) for conv in self.convs1]
-    x = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in x]
-    x = torch.cat(x, 1)
-    x = self.dropout(x)
-    logits = []
-    for option in options:
-        y = self.embed(options)
-        y = y.unsqueeze(1)
-        y = [F.relu(conv(y)).squeeze(3) for conv in self.convs1]
-        y = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in y]
-        y = torch.cat(y, 1)
-        y = self.dropout(y)
-        logit = self.fc1(x,y)
-        logits.append(logit)
-    logits = torch.from_numpy(np.array(logits))
-    return logits
+    model = onmt.Models.NMTModel(encoder, decoder)
+    model.generator = generator
+    self.model = model
+  def forward(self, src):
+    return self.model(src)
+
+class MultiChoiceQAModel(nn.Module):
+  def __init__(self, args):
+    super(MultiChoiceQAModel, self).__init__()
+    self.args = args
+    if args.pre_word_vecs_enc is not None:
+      pretrained = torch.load(args.pre_word_vecs_enc)
+      self.embed = nn.Embedding(pretrained.size(0), pretrained.size(1))
+      self.embed.weight.data.copy_(pretrained)
+      if not args.update_embedding:
+        self.embed.weight.requires_grad = False
+    else:
+      self.embed = nn.Embedding(args.vocab_size,
+                                args.word_vec_size,
+                                padding_idx=onmt.Constants.PAD)
+    self.seq2seq_model = Seq2seqModel(args)
+
+
+  def forward(self, dialogue, options, answer):
+    def lstm_state_flatten(state):
+      h, c = state
+      h = h.transpose(0,1).transpose(1,2).contiguous().view(h.size(1),-1)
+      c = c.transpose(0,1).transpose(1,2).contiguous().view(c.size(1),-1)
+      #h = h.view(h.size(0), -1)
+      #c = c.view(c.size(0), -1)
+      return torch.cat((h,c), -1)
+    dialogue = self.embed(dialogue)
+    answer = self.embed(answer)
+    old_size = options.size()
+    options = self.embed(options.view(options.size(0), -1))
+    response, resp_vec = self.seq2seq_model([dialogue, answer]) # resp_vec.size: [batch_size, rnn_size]
+    opts_vec, _ = self.seq2seq_model.model.encoder(options) #opts_vec.size: [batch_size*num_options, rnn_size]
+    opts_vec = lstm_state_flatten(opts_vec)
+    resp_vec = lstm_state_flatten(resp_vec)
+    opts_vec = opts_vec.view(old_size[1], old_size[2], -1).contiguous()
+    resp_vec = resp_vec.unsqueeze(1).contiguous()
+    sums = opts_vec * resp_vec
+    scores = torch.sum(sums, -1)
+    return scores, response

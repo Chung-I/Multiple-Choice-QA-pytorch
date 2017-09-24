@@ -1,19 +1,23 @@
-from tensorpack import RNGDataFlow, BatchData
+from tensorpack.dataflow import RNGDataFlow, BatchData
 import csv
 import os
 import re
 import random
+import numpy as np
+import onmt
 
 _WORD_SPLIT = re.compile(r"([\u4e00-\u9fa5\uff0c\u3002]|[a-zA-Z0-9_]+)")
 
-_PAD = "_PAD"
-_EOS = "_EOS"
-_UNK = "_UNK"
+_PAD = onmt.Constants.PAD_WORD
+_EOS = onmt.Constants.EOS_WORD
+_UNK = onmt.Constants.UNK_WORD
 _START_VOCAB = [_PAD, _EOS, _UNK]
 
-PAD_ID = 0
-EOS_ID = 1
-UNK_ID = 2
+PAD_ID = onmt.Constants.PAD
+EOS_ID = onmt.Constants.EOS
+UNK_ID = onmt.Constants.UNK
+
+MAX_SEQ_LEN = 40
 
 _DIGIT_RE = re.compile(r"\d")
 
@@ -63,6 +67,14 @@ def create_vocabulary(vocabulary_path, data_path, max_vocabulary_size,
                 for w in vocab_list:
                     vocab_file.write(w + "\n")
 
+class LEN_TOO_LONG_ERR(BaseException):
+    pass
+
+def pad(sentence, seq_len=MAX_SEQ_LEN):
+    if len(sentence) > seq_len:
+        raise LEN_TOO_LONG_ERR 
+    return sentence + [PAD_ID] * (seq_len - len(sentence))
+
 def sentence_to_token_ids(sentence, vocabulary,
                           tokenizer=None, normalize_digits=True):
 
@@ -71,24 +83,24 @@ def sentence_to_token_ids(sentence, vocabulary,
   else:
     words = basic_tokenizer(sentence)
   if not normalize_digits:
-    return [vocabulary.get(w, UNK_ID) for w in words]
+    return pad([vocabulary.get(w, UNK_ID) for w in words])
   # Normalize digits by 0 before looking words up in the vocabulary.
-  return [vocabulary.get(_DIGIT_RE.sub("0", w), UNK_ID) for w in words]
+  return pad([vocabulary.get(_DIGIT_RE.sub("0", w), UNK_ID) for w in words])
 
 
-class LCData(RNGDataFlow):
-    def __init__(self, csv_path, has_label=False, vocab_path=None):
-        self.csv_path = csv_path
-        self.has_label = has_label
+class GenLCData(RNGDataFlow):
+    def __init__(self, dialog_path, vocab_path=None):
+        self.dialog_path = dialog_path
         if vocab_path is None:
             vocab_path = "vocab.txt"
-            create_vocabulary(vocab_path, csv_path, 20000)
+            create_vocabulary(vocab_path, dialog_path, 20000)
         self.vocab_path = vocab_path
 
     def get_data(self):
         vocab, rev_vocab = initialize_vocabulary(self.vocab_path)
-        with open(self.csv_path) as csvfile:
+        with open(self.dialog_path) as csvfile:
             lines = csvfile.read().splitlines()
+            num_discard = 0
             for idx, row in enumerate(lines):
                 if idx % 3 == 0:
                     continue
@@ -107,14 +119,24 @@ class LCData(RNGDataFlow):
                 random.shuffle(indexed_options)
                 answer_id = [idx for idx, option in enumerate(indexed_options) if option[0] == 0][0]
                 options = [i[1] for i in indexed_options]
-                dialogue = sentence_to_token_ids(dialogue, vocab)
-                options = [sentence_to_token_ids(opt, vocab) for opt in options]
-                yield [dialogue, *options, answer_id]
+                try:
+                    dialogue = sentence_to_token_ids(dialogue, vocab)
+                    options = [sentence_to_token_ids(opt, vocab) for opt in options]
+                    dialogue = np.array(dialogue, dtype=np.int32)
+                    options = np.array(options, dtype=np.int32)
+                    answer_id = np.array(answer_id, dtype=np.int32)
+                    yield [dialogue, options, answer_id]
+                except LEN_TOO_LONG_ERR:
+                    num_discard += 1
 
 
 
 if __name__ == '__main__':
-    ds = LCData("data/all_no_TC.txt", has_label=False)
-    ds = BatchData(ds, 64, use_list=True)
+    import sys
+    ds = LCData(sys.argv[1])
+    ds = BatchData(ds, 64)
     b = ds.get_data()
-    print(next(b))
+    c = next(b)
+    print(c[0].shape)
+    print(c[1].shape)
+    print(c[2].shape)
